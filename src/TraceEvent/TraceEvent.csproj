@@ -2,7 +2,7 @@
 <Project Sdk="Microsoft.NET.Sdk"> 
 
   <PropertyGroup>
-    <TargetFrameworks>net45;netstandard1.6;netstandard2.0</TargetFrameworks>
+    <TargetFramework>net45</TargetFramework>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -10,10 +10,10 @@
     <AssemblyName>Microsoft.Diagnostics.Tracing.TraceEvent</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-    <Description>TraceEvent library.</Description>
+    <Description>TraceEvent library, with improved GetManifestForRegisteredProvider</Description>
     <Company>Microsoft</Company>
-    <Copyright>Copyright © Microsoft 2010</Copyright>
-    <Version>$(TraceEventVersion)</Version>
+    <Copyright>Copyright © Microsoft 2019</Copyright>
+    <Version>2.0.44</Version>
     <FileVersion>$(TraceEventVersion)</FileVersion>
     <InformationalVersion>$(TraceEventVersion)</InformationalVersion>
     <NeutralLanguage>en</NeutralLanguage>
@@ -176,5 +176,9 @@
     <SignAssembly Condition="'$(SIGNING_BUILD)'!= ''">true</SignAssembly>
     <DelaySign>true</DelaySign>
     <AssemblyOriginatorKeyFile>..\MSFT.snk</AssemblyOriginatorKeyFile>
+    <PackageId>Microsoft.Diagnostics.Tracing.TraceEvent2</PackageId>
+    <Authors>Microsoft.Diagnostics.Tracing.TraceEvent2</Authors>
+    <Product>Microsoft.Diagnostics.Tracing.TraceEvent2</Product>
+    <AssemblyVersion>2.0.44.1</AssemblyVersion>
   </PropertyGroup>
 </Project>
