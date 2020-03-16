@@ -1461,7 +1461,7 @@ public class GCHeapDumper
             var rootDuration = m_sw.Elapsed.TotalMilliseconds - rootsStartTimeMSec;
             m_log.WriteLine("Scanning UNNAMED GC roots took {0:n1} msec", rootDuration);
         }
-        catch (Exception e)
+        catch (Exception e) when (!(e is OutOfMemoryException))
         {
             m_log.WriteLine("[ERROR while processing roots: {0}", e.Message);
             m_log.WriteLine("Continuing without complete root information");
@@ -2501,7 +2501,7 @@ public class GCHeapDumper
         }
         else
         {
-            ret = GetTypeIndexForName(name, type.Module.FileName, 0);
+            ret = GetTypeIndexForName(name ?? "<Unnamed "+ type.MetadataToken.ToString("x8") + ">", type.Module.FileName, 0);
             m_typeIdxToGraphIdx[idx] = (int)ret + 1;
         }
         return ret;

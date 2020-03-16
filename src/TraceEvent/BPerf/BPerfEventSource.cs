@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Tracing.Parsers;
@@ -31,7 +32,7 @@ namespace Microsoft.Diagnostics.Tracing
     /// 
     /// The compression mechanism is using the NTDLL.RtlDecompressBufferEx Express Huffman procedure.
     /// </summary>
-    public sealed class BPerfEventSource : TraceEventDispatcher, IDisposable
+    public sealed class BPerfEventSource : TraceEventDispatcher
     {
         private const int OffsetToExtendedData = 88; // offsetof(TraceEventNativeMethods.EVENT_RECORD*, ExtendedData);
 
@@ -43,11 +44,25 @@ namespace Microsoft.Diagnostics.Tracing
 
         private const int ReadAheadBufferSize = 1024 * 1024 * 1;
 
+        private const int BPerfManagedSymbolDatabaseLocationEventId = 65533;
+
+        private static readonly Guid BPerfGuid = new Guid("{79430003-51bf-5f05-ed34-99cf32652c26}");
+
+        private static readonly Guid ClrGuid = new Guid("{e13c0d23-ccbc-4e12-931b-d9cc2eee27e4}");
+
         private static readonly Guid EventTraceGuid = new Guid("{68fdd900-4a3e-11d1-84f4-0000f80464e3}");
 
-        private readonly string btlFilePath;
+        private static readonly Guid ImageLoadGuid = new Guid("{2cb15d1d-5fc1-11d2-abe1-00a0c911f518}");
 
-        private readonly long fileOffset;
+        private static readonly Guid VolumeMappingGuid = new Guid("{9b79ee91-b5fd-41c0-a243-4248e266e9d0}");
+
+        private static readonly Guid ProcessGuid = new Guid("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}");
+
+        private static readonly Guid KernelTraceControlImageIdGuid = new Guid("{b3e675d7-2554-4f18-830b-2762732560de}");
+
+        private static readonly Guid KernelTraceControlMetaDataGuid = new Guid("{bbccf6c1-6cd1-48c4-80ff-839482e37671}");
+
+        private readonly string btlFilePath;
 
         private readonly byte[] workspace;
 
@@ -57,28 +72,72 @@ namespace Microsoft.Diagnostics.Tracing
 
         private readonly Dictionary<int, string> processNameForID = new Dictionary<int, string>();
 
+        private readonly long endQPCForManagedSymbolsInclusion;
+
+        private readonly long skipQPC;
+
+        private readonly long endFileOffset;
+
+        private readonly bool canResolveSymbols;
+
         private int eventsLost;
 
+        private long startFileOffset;
+
         public BPerfEventSource(string btlFilePath)
-            : this(btlFilePath, 0)
+            : this(btlFilePath, new TraceEventDispatcherOptions())
         {
         }
 
         /// <summary>
         /// This constructor is used when the consumer has an offset within the BTL file that it would like to seek to.
         /// </summary>
-        public BPerfEventSource(string btlFilePath, long fileOffset)
-            : this(btlFilePath, fileOffset, new byte[BufferSize], new byte[BufferSize], new byte[BufferSize])
+        public BPerfEventSource(string btlFilePath, TraceEventDispatcherOptions traceEventDispatcherOptions)
+            : this(btlFilePath, traceEventDispatcherOptions, new byte[BufferSize], new byte[BufferSize], new byte[BufferSize])
         {
         }
 
         /// <summary>
         /// This constructor is used when the consumer is supplying the buffers for reasons like buffer pooling.
         /// </summary>
-        public BPerfEventSource(string btlFilePath, long fileOffset, byte[] workspace, byte[] uncompressedBuffer, byte[] compressedBuffer)
+        public BPerfEventSource(string btlFilePath, TraceEventDispatcherOptions options, byte[] workspace, byte[] uncompressedBuffer, byte[] compressedBuffer, bool skipReadingUnreachableEvents = false)
         {
+            var startTime = DateTime.MinValue;
+            var endTime = DateTime.MaxValue;
+            if (options != null)
+            {
+                startTime = options.StartTime == default(DateTime) ? DateTime.MinValue : options.StartTime;
+                endTime = options.EndTime == default(DateTime) ? DateTime.MaxValue : options.EndTime;
+            }
             this.btlFilePath = btlFilePath;
-            this.fileOffset = fileOffset;
+            this.startFileOffset = 0;
+            this.endQPCForManagedSymbolsInclusion = long.MaxValue;
+            this.skipQPC = 0;
+            this.endFileOffset = long.MaxValue;
+            this.canResolveSymbols = !skipReadingUnreachableEvents;
+
+            string indexFile = this.btlFilePath + ".id";
+            bool indexFileExists = File.Exists(indexFile);
+
+            if (indexFileExists)
+            {
+                var tmp = GetOffset(indexFile, startTime, out this.endQPCForManagedSymbolsInclusion, out var skipqpc);
+                if (startTime > DateTime.MinValue)
+                {
+                    this.skipQPC = skipqpc;
+
+                    if (skipReadingUnreachableEvents)
+                    {
+                        this.startFileOffset = tmp;
+                    }
+                }
+            }
+
+            if (endTime < DateTime.MaxValue && indexFileExists)
+            {
+                this.endFileOffset = GetOffset(indexFile, endTime, out _, out _);
+            }
+
             this.workspace = workspace;
             this.uncompressedBuffer = uncompressedBuffer;
             this.compressedBuffer = compressedBuffer;
@@ -106,14 +165,101 @@ namespace Microsoft.Diagnostics.Tracing
             return ret;
         }
 
+        private bool ProcessMetadataEvents()
+        {
+            var metaFile = this.btlFilePath + ".md"; // appending the .md file extension to the original file path is the convention
+            if (!File.Exists(metaFile))
+            {
+                return false;
+            }
+
+            byte[] buffer;
+            using (var fs = new FileStream(metaFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                var length = (int)fs.Length;
+
+                buffer = new byte[length];
+
+                int chunkSize = 64 * 1024; // 64KB is a reasonable size
+
+                int read = 0;
+                int chunk;
+
+                while ((chunk = fs.Read(buffer, read, Math.Min(chunkSize, length - read))) > 0)
+                {
+                    read += chunk;
+
+                    if (read == length)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            const int SizeOfEventHeader = 80; // https://docs.microsoft.com/en-us/windows/desktop/api/evntcons/ns-evntcons-_event_header
+
+            int off = 0;
+            while (off + SizeOfEventHeader + sizeof(int) < buffer.Length)
+            {
+                unsafe
+                {
+                    fixed (byte* ptr = &buffer[off])
+                    {
+                        var source = (TraceEventNativeMethods.EVENT_RECORD*)ptr;
+
+                        TraceEventNativeMethods.EVENT_RECORD eventRecord;
+                        eventRecord.EventHeader = source->EventHeader;
+
+                        off += SizeOfEventHeader;
+                        var userDataLength = BitConverter.ToInt32(buffer, off);
+                        off += sizeof(int);
+
+                        if (off + userDataLength <= buffer.Length)
+                        {
+                            fixed (byte* userData = &buffer[off])
+                            {
+                                eventRecord.UserDataLength = (ushort)userDataLength;
+                                eventRecord.UserData = (IntPtr)userData;
+                                this.ProcessEventRecord(&eventRecord, dispatch: false);
+                            }
+                        }
+
+                        off += userDataLength;
+                    }
+                }
+            }
+
+            return true;
+        }
+
         private void ProcessInner()
         {
+            // If there is a non-zero offset then we need to process the metadata events first right after TraceEvent's internal book-keeping.
+            // Think EventSourceManifest events, TRACE_EVENT_INFO*, TraceLogging etc.
+            // The ".md" file is generated by BPerf in multi-session scenarios.
+            if (this.startFileOffset > 0 && this.sessionStartTimeQPC != 0)
+            {
+                // For whatever reason the metadata file reading failed, we should give the slow but correct experience.
+                if (!this.ProcessMetadataEvents())
+                {
+                    this.startFileOffset = 0;
+                }
+            }
+
+            long startingPosition = 0;
             using (var fs = new FileStream(this.btlFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
-                long remainingFileSize = (fs.Length - fileOffset) & ~(16 - 1); // align down to 16 byte boundary
+                // Once TraceEvent has finished its book-keeping, we should seek to the file offset (if any).
+                if (this.sessionStartTimeQPC != 0)
+                {
+                    startingPosition = this.startFileOffset;
+                    fs.Seek(startingPosition, SeekOrigin.Begin);
+                }
+
+                long remainingFileSize = Math.Min(this.endFileOffset - startingPosition, (fs.Length - startingPosition + (16 - 1)) & ~(16 - 1)); // align up to 16 byte boundary
                 int offset = 0;
 
-                while (remainingFileSize > 0)
+                while (remainingFileSize > 0 && !this.stopProcessing)
                 {
                     bool exitCondition = false;
                     int bytesToRead = (int)Math.Min(remainingFileSize, ReadAheadBufferSize);
@@ -126,7 +272,7 @@ namespace Microsoft.Diagnostics.Tracing
                         offset = 0;
                     }
 
-                    int realReadBytes = bytesToRead - offset;
+                    int realReadBytes = 0;
                     while (bytesToRead > offset)
                     {
                         int bytesRead = fs.Read(this.compressedBuffer, savedOffset, bytesToRead - offset);
@@ -141,9 +287,12 @@ namespace Microsoft.Diagnostics.Tracing
                         }
 
                         offset += bytesRead;
+                        realReadBytes += bytesRead;
                     }
 
-                    int retval = this.ProcessBTLInner(bytesToRead + remainder);
+                    // Since we align up the boundary, because the available bytes may less than bytesToRead, the real buffer size is current offset + remainder.
+                    // if the are enough bytes to read, offset equals bytesToRead.
+                    int retval = this.ProcessBTLInner(offset + remainder);
 
                     if (exitCondition || retval == -1) // retval == -1 means initialization loop, so bail.
                     {
@@ -216,10 +365,150 @@ namespace Microsoft.Diagnostics.Tracing
             return false;
         }
 
+        private unsafe TraceEventNativeMethods.EVENT_RECORD* DeserializeEventRecord(byte* buffer, ref int retVal)
+        {
+            int bufferOffset = OffsetToExtendedData + 24; // store space for 3 8-byte pointers regardless of arch
+            var eventRecord = (TraceEventNativeMethods.EVENT_RECORD*)buffer;
+
+            eventRecord->UserData = new IntPtr(buffer + bufferOffset);
+
+            bufferOffset += eventRecord->UserDataLength;
+            bufferOffset = AlignUp(bufferOffset, 8);
+
+            eventRecord->ExtendedData = eventRecord->ExtendedDataCount > 0 ? (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)(buffer + bufferOffset) : (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)0;
+            bufferOffset += sizeof(TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM) * eventRecord->ExtendedDataCount;
+
+            for (ushort i = 0; i < eventRecord->ExtendedDataCount; ++i)
+            {
+                eventRecord->ExtendedData[i].DataPtr = (ulong)(buffer + bufferOffset);
+
+                bufferOffset += eventRecord->ExtendedData[i].DataSize;
+                bufferOffset = AlignUp(bufferOffset, 8);
+            }
+
+            bufferOffset = AlignUp(bufferOffset, 16);
+            retVal += bufferOffset;
+
+            return eventRecord;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private unsafe void ParseBPerfManagedSymbol(TraceEventNativeMethods.EVENT_RECORD* eventRecord)
+        {
+            var bperfLogLocation = Path.Combine(Path.GetDirectoryName(this.btlFilePath), Path.GetFileName(Marshal.PtrToStringAnsi(eventRecord->UserData)));
+
+            if (!File.Exists(bperfLogLocation))
+            {
+                return;
+            }
+
+            var firstDot = bperfLogLocation.IndexOf('.') + 1;
+            var nextDot = bperfLogLocation.IndexOf('.', firstDot);
+            var processId = int.Parse(bperfLogLocation.Substring(firstDot, nextDot - firstDot));
+
+            using (var fs = new FileStream(bperfLogLocation, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                long length = fs.Length;
+
+#if NET45
+                using (var mmapedFile = MemoryMappedFile.CreateFromFile(fs, null, length, MemoryMappedFileAccess.Read, null, HandleInheritability.None, true))
+#else
+                using (var mmapedFile = MemoryMappedFile.CreateFromFile(fs, null, length, MemoryMappedFileAccess.Read, HandleInheritability.None, true))
+#endif
+                {
+                    var accessor = mmapedFile.CreateViewAccessor(0, length, MemoryMappedFileAccess.Read);
+                    byte* ptr = (byte*)0;
+                    accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+
+                    const int HeaderSize = 16;
+
+                    long position = 0;
+                    while (position + HeaderSize < length)
+                    {
+                        var eventIdToken = accessor.ReadByte(position);
+                        var version = accessor.ReadByte(position + 1);
+                        var flags = accessor.ReadUInt16(position + 2);
+                        var eventId = accessor.ReadUInt16(position + 4);
+                        var userDataLength = accessor.ReadUInt16(position + 6);
+                        var timestamp = accessor.ReadInt64(position + 8);
+
+                        position += HeaderSize;
+
+                        if (position + userDataLength <= length)
+                        {
+                            if (timestamp <= this.endQPCForManagedSymbolsInclusion)
+                            {
+                                if (eventIdToken == 2) // CLR Events
+                                {
+                                    TraceEventNativeMethods.EVENT_RECORD e;
+                                    e.ExtendedDataCount = 0;
+                                    e.UserDataLength = userDataLength;
+                                    e.UserData = new IntPtr(ptr + position);
+                                    e.EventHeader.TimeStamp = timestamp < this.sessionEndTimeQPC ? this.sessionEndTimeQPC : timestamp;
+                                    e.EventHeader.Flags = flags;
+                                    e.EventHeader.ThreadId = 0;
+                                    e.EventHeader.ProcessId = processId;
+                                    e.EventHeader.Version = version;
+                                    e.EventHeader.Id = eventId;
+                                    e.EventHeader.ProviderId = ClrGuid;
+
+                                    this.ProcessEventRecord(&e, dispatch: true);
+                                }
+                            }
+                        }
+
+                        position += userDataLength;
+                    }
+                }
+            }
+        }
+
+        private unsafe void ProcessEventRecord(TraceEventNativeMethods.EVENT_RECORD* eventRecord, bool dispatch)
+        {
+            // BPerf writes a symbol db outside of the main file
+            if (eventRecord->EventHeader.Id == BPerfManagedSymbolDatabaseLocationEventId && eventRecord->EventHeader.ProviderId == BPerfGuid)
+            {
+                this.ParseBPerfManagedSymbol(eventRecord);
+            }
+
+            // BPerf puts 65535 for Classic Events, TraceEvent fires an assert for that case.
+            if ((eventRecord->EventHeader.Flags & TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER) != 0)
+            {
+                eventRecord->EventHeader.Id = 0;
+            }
+
+            var traceEvent = this.Lookup(eventRecord);
+            traceEvent.DebugValidate();
+
+            if (traceEvent.NeedsFixup)
+            {
+                traceEvent.FixupData();
+            }
+
+            if (dispatch)
+            {
+                bool eventNeededForSymbolResolution = false;
+                if (this.canResolveSymbols)
+                {
+                    ref Guid providerId = ref eventRecord->EventHeader.ProviderId;
+                    eventNeededForSymbolResolution = providerId == ClrGuid
+                        ? eventRecord->EventHeader.Id == 190 ||
+                          eventRecord->EventHeader.Id >= 143 && eventRecord->EventHeader.Id <= 157
+                        : providerId == ImageLoadGuid || providerId == ProcessGuid || providerId == VolumeMappingGuid || providerId == KernelTraceControlImageIdGuid || providerId == KernelTraceControlMetaDataGuid;
+                }
+
+                if (eventRecord->EventHeader.TimeStamp >= this.skipQPC || eventNeededForSymbolResolution)
+                {
+                    this.Dispatch(traceEvent);
+                    this.sessionEndTimeQPC = Math.Max(eventRecord->EventHeader.TimeStamp, this.sessionEndTimeQPC);
+                }
+            }
+        }
+
         private unsafe int ProcessBTLInner(int eof)
         {
             int offset = 0;
-            while (offset + 8 < eof)
+            while (offset + 8 < eof && !this.stopProcessing)
             {
                 int compressedBufferSize = BitConverter.ToInt32(this.compressedBuffer, offset);
                 offset += 4;
@@ -242,31 +531,9 @@ namespace Microsoft.Diagnostics.Tracing
                     }
 
                     int bufferOffset = 0;
-                    while (bufferOffset < finalUncompressedSize)
+                    while (bufferOffset < finalUncompressedSize && !this.stopProcessing)
                     {
-                        var eventRecord = (TraceEventNativeMethods.EVENT_RECORD*)(uncompressedBufferPtr + bufferOffset);
-
-                        bufferOffset += OffsetToExtendedData;
-                        bufferOffset += 24; // store space for 3 8-byte pointers regardless of arch
-
-                        eventRecord->UserData = new IntPtr(uncompressedBufferPtr + bufferOffset);
-
-                        bufferOffset += eventRecord->UserDataLength;
-                        bufferOffset = AlignUp(bufferOffset, 8);
-
-                        eventRecord->ExtendedData = eventRecord->ExtendedDataCount > 0 ? (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)(uncompressedBufferPtr + bufferOffset) : (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)0;
-
-                        bufferOffset += sizeof(TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM) * eventRecord->ExtendedDataCount;
-
-                        for (ushort i = 0; i < eventRecord->ExtendedDataCount; ++i)
-                        {
-                            eventRecord->ExtendedData[i].DataPtr = (ulong)(uncompressedBufferPtr + bufferOffset);
-
-                            bufferOffset += eventRecord->ExtendedData[i].DataSize;
-                            bufferOffset = AlignUp(bufferOffset, 8);
-                        }
-
-                        bufferOffset = AlignUp(bufferOffset, 16);
+                        var eventRecord = this.DeserializeEventRecord(uncompressedBufferPtr + bufferOffset, ref bufferOffset);
 
                         if (this.sessionStartTimeQPC == 0)
                         {
@@ -280,22 +547,7 @@ namespace Microsoft.Diagnostics.Tracing
                             }
                         }
 
-                        // BPerf puts 65535 for Classic Events, TraceEvent fires an assert for that case.
-                        if ((eventRecord->EventHeader.Flags & TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER) != 0)
-                        {
-                            eventRecord->EventHeader.Id = 0;
-                        }
-
-                        var traceEvent = this.Lookup(eventRecord);
-                        traceEvent.DebugValidate();
-
-                        if (traceEvent.NeedsFixup)
-                        {
-                            traceEvent.FixupData();
-                        }
-
-                        this.Dispatch(traceEvent);
-                        this.sessionEndTimeQPC = eventRecord->EventHeader.TimeStamp;
+                        this.ProcessEventRecord(eventRecord, dispatch: true);
                     }
 
                     offset += compressedBufferSize;
@@ -309,6 +561,56 @@ namespace Microsoft.Diagnostics.Tracing
         private static int AlignUp(int num, int align)
         {
             return (num + (align - 1)) & ~(align - 1);
+        }
+
+        private static long GetOffset(string indexFile, DateTime requestTimestamp, out long sessionStartQPC, out long ts)
+        {
+            sessionStartQPC = 0;
+            ts = 0;
+
+            if (!File.Exists(indexFile))
+            {
+                return 0;
+            }
+
+            byte[] buffer;
+
+            using (var fs = new FileStream(indexFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                using (var br = new BinaryReader(fs))
+                {
+                    buffer = br.ReadBytes((int)fs.Length);
+                }
+            }
+
+            if (buffer.Length < 32)
+            {
+                return 0;
+            }
+
+            var fileTimestamp = DateTime.FromFileTime(BitConverter.ToInt64(buffer, 0));
+            long perfFreq = BitConverter.ToInt64(buffer, 8);
+            sessionStartQPC = BitConverter.ToInt64(buffer, 16);
+
+            var timeEntries = (buffer.Length - 16) / 16;
+
+            for (int i = 1; i < timeEntries; ++i)
+            {
+                ts = BitConverter.ToInt64(buffer, 16 + (i * 16));
+                var diff = ts - sessionStartQPC;
+                diff *= 1000000;
+                diff /= perfFreq;
+                diff /= 1000;
+
+                var currentTime = fileTimestamp + TimeSpan.FromMilliseconds(diff);
+                if (currentTime >= requestTimestamp)
+                {
+                    ts = BitConverter.ToInt64(buffer, 16 + ((i - 1) * 16));
+                    return BitConverter.ToInt64(buffer, 16 + ((i - 1) * 16) + 8);
+                }
+            }
+
+            return 0;
         }
 
         [DllImport("ntdll.dll")]
